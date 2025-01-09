@@ -1,0 +1,370 @@
+### analyzing TCGA-LUAD data ###
+library(tidyverse)
+library(TCGAbiolinks)
+
+query <- GDCquery(project = "TCGA-LUAD",
+                  
+                  data.category = "Transcriptome Profiling",
+                  
+                  data.type = "Gene Expression Quantification",
+                  
+                  workflow.type = "STAR - Counts")
+
+data <- GDCdownload(query,  directory = "GDCata") 
+expquery2<-GDCprepare(query,directory = "GDCata",summarizedExperiment = T)
+
+save(expquery2,file = "LUAD.gdc_2022.rda")
+load("~/bulk_RNA_seq/TCGA_LIHC/gene_annotation_2022.rda")
+load("LUAD.gdc_2022.rda")
+
+counts<-expquery2@assays@data@listData[["unstranded"]]
+colnames(counts)<-expquery2@colData@rownames
+rownames(counts)<-expquery2@rowRanges@ranges@NAMES
+counts<-as.data.frame(counts)
+counts<-rownames_to_column(counts,var ='ENSEMBL')
+
+counts <-inner_join(names,counts,"ENSEMBL")
+
+keepData<- rowSums(counts > 0) >= floor(0.75*ncol(counts))
+counts<-counts[keepData,]
+
+counts <-counts[!duplicated(counts$symbol),]
+
+table(counts$type)
+
+counts1 <-subset(counts, type=="protein_coding")
+counts1 <-counts1[,-1]
+counts1 <-counts1[,-2]
+
+m=as.matrix(counts1[, 1])
+v=as.vector(m)
+counts1<-counts1[, -1]
+row.names(counts1) <- v
+
+conditions<- read.table("MEN1_FPKM_Group.txt",sep="\t",row.names = 1, check.names = F,header = T) 
+
+counts_MEN1 <- counts1[,rownames(conditions)]
+
+conditions$group<-factor(conditions$group,levels =c("High","Low"))
+class(conditions$group)
+
+library(DESeq2)
+dds<- DESeqDataSetFromMatrix(
+  countData = counts_MEN1,
+  colData = conditions,
+  design = ~ group)
+
+dds<-DESeq(dds)
+
+resultsNames(dds)
+
+res<-results(dds)
+
+DEG<-as.data.frame(res)
+
+logFC_cutoff<-0.585
+type1 = (DEG$padj < 0.01)&(DEG$log2FoldChange < -logFC_cutoff)
+type2 = (DEG$padj < 0.01)&(DEG$log2FoldChange > logFC_cutoff)
+DEG$change = ifelse(type1,"DOWN",ifelse(type2,"UP","NOT"))
+table(DEG$change)
+
+write.table(DEG,file="TCGA_LUAD_primary_MEN1_low_vs_high_DEG.txt",sep="\t", quote = F)
+
+lyso_set <- read.table("KEGG_LYSOSOME.txt",sep="\t",row.names = 1, check.names = F,header = T)
+lyso_set_deg <- DEG[lyso_set$symbol,]
+write.table(lyso_set_deg,file="TCGA_LUAD_primary_MEN1_low_vs_high_DEG_lyso_set.txt",sep="\t", quote = F)
+
+auto_set <- read.table("REACTOME_AUTOPHAGY.txt",sep="\t", check.names = F,header = T)
+auto_set <-auto_set[-1,]
+auto_set_deg <- DEG[auto_set,]
+write.table(auto_set_deg,file="TCGA_LUAD_primary_MEN1_low_vs_high_DEG_auto_set.txt",sep="\t", quote = F)
+
+## volcano plot
+load("LUAD_MEN1_CDDisease_241123.RData") 
+library(ggplot2)
+library(ggrepel)
+
+library(pheatmap)
+
+log2FC = 0.585 
+pvalue = 0.01 
+
+gene_set <- c("MEN1","CTSB","GAA","TFE3","TCIRG1","CTSD","CTSE","NAPSA","ATP6V0C","SQSTM1")
+
+DEG$label = ifelse(rownames(DEG) %in% gene_set , as.character(rownames(DEG)), '')
+
+ggplot(DEG,aes(log2FoldChange,-1*log10(padj))) +    
+  geom_point(aes(color = change)) +                           
+  xlab("log2 fold change") + 
+  ylab("-log10 p-value") +
+  #ggtitle( this_tile ) +                             
+  # scale_color_manual(values = c("blue","green","red")) + 
+  scale_color_manual(values=c("#546de5", "#d2dae2","#ff4757"))+
+  geom_hline(yintercept=-log10(pvalue),linetype=2)+       
+  geom_vline(xintercept=c(-(log2FC),log2FC),linetype=2)+ 
+  geom_text_repel(aes(x = log2FoldChange,                   
+                      y = -1*log10(padj),          
+                      label=label),                       
+                  max.overlaps = 1000000,                    
+                  size=3,                                  
+                  box.padding=unit(0.5,'lines'),           
+                  point.padding=unit(0.1, 'lines'), 
+                  segment.color='black',      
+                  show.legend=FALSE)                      
+#graph2ppt(file="d2gene_Volcano-name.ppt", width=10, aspectr=1)
+
+## KEGG
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+a<- filter(DEG,change == "DOWN")
+DEG1 <-DEG[rownames(a),]
+DEG1<- rownames_to_column(DEG1,"SYMBOL")
+genelist <- bitr(DEG1$SYMBOL,fromType = "SYMBOL",
+                 toType = "ENTREZID",OrgDb = "org.Hs.eg.db",)
+DEG1 <- inner_join(DEG1,genelist,by="SYMBOL")
+
+kk <- enrichKEGG(gene = DEG1$ENTREZID,
+                 organism = "hsa",
+                 pvalueCutoff = 0.1,
+                 qvalueCutoff = 0.1
+)
+kk_res <- kk@result
+
+top_kk_df <- kk_res %>%  
+  arrange(p.adjust) %>%       
+  slice_head(n = 30)     # top30  
+top_kk_df$`-log10 (p.adjust)` <- -log10(top_kk_df$p.adjust) #log10
+top_kk_df$p.adjust <- as.numeric(formatC(top_kk_df$p.adjust, format = "e", digits = 2)) 
+class(top_kk_df$p.adjust)
+
+p3 <- ggplot(top_kk_df,aes(y=reorder(Description, `-log10 (p.adjust)`),x=Count,fill=p.adjust))+
+  geom_bar(stat = "identity",width=0.8)+   
+  scale_fill_gradient(low = "red",high ="blue" )+  
+  labs(title = "KEGG Pathways Enrichment",         
+       x = "Gene number",       
+       y = "Pathway")+  
+  theme(axis.title.x = element_text(face = "bold",size = 16),        
+        axis.title.y = element_text(face = "bold",size = 16),    
+        legend.title = element_text(face = "bold",size = 16))+  
+  theme_bw()
+p3
+
+### A549 RNA-seq data ###
+setwd("~/bulk_RNA_seq/A549_shMEN1")
+library(tidyverse)
+counts <- read.table("gene_count.txt", sep = "\t", row.names = 1, check.names = FALSE, header = TRUE, fill = TRUE, quote = "")
+FPKM <- read.table("gene_fpkm.txt",sep = "\t", row.names = 1, check.names = FALSE, header = TRUE, fill = TRUE, quote = "") 
+counts1 <- counts[,-(14:15)]
+counts1 <- counts1[,-(8:12)]
+table(counts1$gene_biotype)
+
+counts1 <- subset(counts1, gene_biotype=="protein_coding")
+counts1 <- counts1[,1:6]
+
+keepData<- rowSums(counts1 > 0) >= floor(0.75*ncol(counts1))#选做
+counts1<-counts1[keepData,]
+
+gene_name <- counts[,7:8]
+gene_name <- rownames_to_column(gene_name, var = "ENS")
+counts1 <- rownames_to_column(counts1, var = "ENS")
+
+counts1 <-inner_join(counts1,gene_name,"ENS")
+counts1 <-counts1[!duplicated(counts1$gene_name),]
+rownames(counts1) <- counts1$gene_name
+counts1 <- counts1[,2:7]
+conditions <- data.frame(  
+  sample = c("shNC-1", "shNC-2", "shNC-3","shMEN1-1","shMEN1-2","shMEN1-3"),  
+  group = c("Cont","Cont","Cont", "KD", "KD", "KD")  
+) 
+rownames(conditions) <- conditions$sample
+conditions$group<-factor(conditions$group,levels =c("Cont","KD"))
+class(conditions$group)
+
+library(DESeq2)
+dds<- DESeqDataSetFromMatrix(
+  countData = counts1,
+  colData = conditions,
+  design = ~ group)
+
+dds<-DESeq(dds)
+resultsNames(dds)
+res<-results(dds)
+
+save(res,file="a549_shMEN1_res.Rda")
+
+DEG<-as.data.frame(res)
+
+logFC_cutoff<-1 #logFC_cutoff<-0.585
+type1 = (DEG$padj < 0.01)&(DEG$log2FoldChange < -logFC_cutoff)
+type2 = (DEG$padj < 0.01)&(DEG$log2FoldChange > logFC_cutoff)
+DEG$change = ifelse(type1,"DOWN",ifelse(type2,"UP","NOT"))
+table(DEG$change)
+
+write.table(DEG,file="a549_shMEN1_DEG.txt",sep="\t", quote = F)
+DEG <- read.table("a549_shMEN1_DEG.txt", sep = "\t", row.names = 1, check.names = FALSE, header = TRUE, fill = TRUE, quote = "")
+## lysosomal genes
+lyso_set <- read.table("~/bulk_RNA_seq/TCGA_LUAD/KEGG_LYSOSOME.txt",sep="\t",row.names = 1, check.names = F,header = T)
+lyso_set_deg <- DEG[lyso_set$symbol,]
+write.table(lyso_set_deg,file="A549_shMEN1_vs_Cont_DEG_lyso_set.txt",sep="\t", quote = F)
+## autophagic genes
+auto_set <- read.table("~/bulk_RNA_seq/TCGA_LUAD/REACTOME_AUTOPHAGY.txt",sep="\t", check.names = F,header = T)
+auto_set <-auto_set[-1,]
+auto_set_deg <- DEG[auto_set,]
+write.table(auto_set_deg,file="A549_shMEN1_vs_Cont_DEG_auto_set.txt",sep="\t", quote = F)
+## mitochondrial genes
+mito_set <- read.csv("WONG_MITOCHONDRIA_GENE_MODULE.csv")
+mito_set_deg <- DEG[mito_set$GENE_SYMBOLS,]
+write.table(mito_set_deg,file="A549_shMEN1_vs_Cont_DEG_mito_set.txt",sep="\t", quote = F)
+
+# volcano plot
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+log2FC = 0.585 
+pvalue = 0.01 
+
+gene_set <- c("MEN1","CTSB","GAA","TFE3","TCIRG1","ATP6V0D2","MAP1LC3B","SQSTM1","ATG5","ATG7","WIPI1")
+
+DEG$label = ifelse(rownames(DEG) %in% gene_set , as.character(rownames(DEG)), '')
+
+ggplot(DEG,aes(log2FoldChange,-1*log10(padj))) +   
+  geom_point(aes(color = change)) +                           
+  xlab("log2 fold change") + 
+  ylab("-log10 p-value") +
+  #ggtitle( this_tile ) +                             
+  # scale_color_manual(values = c("blue","green","red")) + 
+  scale_color_manual(values=c("#546de5", "#d2dae2","#ff4757"))+
+  geom_hline(yintercept=-log10(pvalue),linetype=2)+        
+  geom_vline(xintercept=c(-(log2FC),log2FC),linetype=2)+ 
+  geom_text_repel(aes(x = log2FoldChange,                   
+                      y = -1*log10(padj),          
+                      label=label),                       
+                  max.overlaps = 1000000,                    
+                  size=3,                                  
+                  box.padding=unit(0.5,'lines'),           
+                  point.padding=unit(0.1, 'lines'), 
+                  segment.color='black',      
+                  show.legend=FALSE)                      
+#graph2ppt(file="d2gene_Volcano-name.ppt", width=10, aspectr=1)
+
+
+#install.packages("pheatmap")
+library(pheatmap)
+library(tidyverse)
+a<- filter(DEG,change == "UP")
+b<- filter(DEG,change == "DOWN")
+c<- rbind(a,b)
+d<- rownames(c)
+exp <- tpms_primary_log2
+
+conditions<-column_to_rownames(condition_qua,var = "sample")
+exp_diff<-exp[d,]
+exp_diff<-exp_diff[, rownames(conditions)]
+
+annotation_col <- conditions
+a <- filter(annotation_col,group == "high")
+b <- filter(annotation_col,group == "low")
+exp_diff_high <- exp_diff[,rownames(a)]
+exp_diff_low <- exp_diff[,rownames(b)]
+exp_diff <- cbind(exp_diff_high,exp_diff_low)
+
+pheatmap(exp_diff,
+         annotation_col = annotation_col,
+         scale = "row",
+         show_rownames = F,
+         show_colnames = F,
+         color = colorRampPalette(c("navy","white","red"))(100),
+         cluster_cols = F,
+         cluster_rows = T,
+         fontsize = 10,
+         fontsize_row = 3,
+         fontsize_col = 3
+)
+
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+a<- filter(DEG,change == "DOWN")
+
+DEG1 <-DEG[rownames(a),]
+DEG1<- rownames_to_column(DEG1,"SYMBOL")
+genelist <- bitr(DEG1$SYMBOL,fromType = "SYMBOL",
+                 toType = "ENTREZID",OrgDb = "org.Hs.eg.db",)
+DEG1 <- inner_join(DEG1,genelist,by="SYMBOL")
+write.table(DEG1,file="TCGA_LUAD_primary_MEN1_high_up_DEG.txt",sep="\t", quote = F)
+
+## KEGG
+kk <- enrichKEGG(gene = DEG1$ENTREZID,
+                 organism = "hsa",
+                 pvalueCutoff = 0.1,
+                 qvalueCutoff = 0.1
+)
+kk_res <- kk@result
+head(kk@result$geneID)
+
+library(clusterProfiler)  
+library(ggplot2)  
+library(dplyr) 
+
+ 
+top_kk_df <- kk_res %>%  
+  arrange(p.adjust) %>%         
+  slice_head(n = 30)     # top30  
+top_kk_df$`-log10 (p.adjust)` <- -log10(top_kk_df$p.adjust) #log10  
+top_kk_df$p.adjust <- as.numeric(formatC(top_kk_df$p.adjust, format = "e", digits = 2)) 
+class(top_kk_df$p.adjust)
+p3 <- ggplot(top_kk_df,aes(y=reorder(Description, `-log10 (p.adjust)`),x=Count,fill=p.adjust))+
+  geom_bar(stat = "identity",width=0.8)+   
+  scale_fill_gradient(low = "red",high ="blue" )+ 
+  labs(title = "KEGG Pathways Enrichment",       
+       x = "Gene number",     
+       y = "Pathway")+ 
+  theme(axis.title.x = element_text(face = "bold",size = 16),     
+        axis.title.y = element_text(face = "bold",size = 16),      
+        legend.title = element_text(face = "bold",size = 16))+  
+  theme_bw()
+p3
+
+### KEGG of ChIP-seq data ###
+ibrary(org.Hs.eg.db)
+library(clusterProfiler)
+DEG1 <- read.table("~/ChIP/RNAseq_ChIPseq_overlap_gene.txt",sep="\t",row.names = 1, check.names = F,header = T)
+DEG1<- rownames_to_column(DEG1,"SYMBOL")
+genelist <- bitr(DEG1$SYMBOL,fromType = "SYMBOL",
+                 toType = "ENTREZID",OrgDb = "org.Hs.eg.db",)
+DEG1 <- inner_join(DEG1,genelist,by="SYMBOL")
+
+## KEGG
+kk <- enrichKEGG(gene = DEG1$ENTREZID,
+                 organism = "hsa",
+                 pvalueCutoff = 0.1,
+                 qvalueCutoff = 0.1
+)
+kk_res <- kk@result
+head(kk@result$geneID)
+
+library(clusterProfiler)  
+library(ggplot2)  
+library(dplyr) 
+
+ 
+top_kk_df <- kk_res %>%  
+  arrange(p.adjust) %>%         
+  slice_head(n = 30)     # top30  
+top_kk_df$`-log10 (p.adjust)` <- -log10(top_kk_df$p.adjust) #log10 
+ 
+top_kk_df$p.adjust <- as.numeric(formatC(top_kk_df$p.adjust, format = "e", digits = 2)) 
+class(top_kk_df$p.adjust)
+
+p3 <- ggplot(top_kk_df,aes(y=reorder(Description, `-log10 (p.adjust)`),x=Count,fill=p.adjust))+  
+  geom_bar(stat = "identity",width=0.8)+   
+  scale_fill_gradient(low = "red",high ="blue" )+  
+  labs(title = "KEGG Pathways Enrichment",        
+       x = "Gene number",    
+       y = "Pathway")+  
+  theme(axis.title.x = element_text(face = "bold",size = 16),        
+        axis.title.y = element_text(face = "bold",size = 16),      
+        legend.title = element_text(face = "bold",size = 16))+
+  theme_bw()
+p3
