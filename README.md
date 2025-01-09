@@ -1,1 +1,1 @@
-# Here is some R code for bioinformatics analysis related to MEN1.
+# Here is the R code for bioinformatics analysis related to MEN1.
